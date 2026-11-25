@@ -49,6 +49,37 @@ func LoadCompleteFromCAR(r io.Reader) (*Repo, *Commit, error) {
 // downloaded a FULL repo (no `since` diff) and need to detect such truncation
 // should use [LoadCompleteFromCAR] or call [Repo.CheckComplete].
 func LoadFromCAR(r io.Reader) (*Repo, *Commit, error) {
+	return loadFromCAR(r, mst.NewMemBlockStore(), (*car.Reader).Next)
+}
+
+// LoadFromCAROnDisk is like [LoadFromCAR], but keeps block contents in a
+// temporary file and the CID-to-offset index in memory. The file uses the
+// system temporary directory. The caller must close the returned closer when
+// done with the repo. Blocks already read remain valid after close. A nil
+// budget leaves the store unmetered.
+func LoadFromCAROnDisk(r io.Reader, budget *CARSpillBudget) (*Repo, *Commit, io.Closer, error) {
+	store, err := newDiskBlockStore(budget)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	loaded := false
+	defer func() {
+		if !loaded {
+			_ = store.Close()
+		}
+	}()
+	rp, commit, err := loadFromCAR(r, store, (*car.Reader).NextInto)
+	if err != nil {
+		if closeErr := store.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+		return nil, nil, nil, err
+	}
+	loaded = true
+	return rp, commit, store, nil
+}
+
+func loadFromCAR(r io.Reader, store mst.BlockStore, next func(*car.Reader) (car.Block, error)) (*Repo, *Commit, error) {
 	cr, err := car.NewReader(r)
 	if err != nil {
 		return nil, nil, fmt.Errorf("repo: reading CAR header: %w", err)
@@ -59,12 +90,11 @@ func LoadFromCAR(r io.Reader) (*Repo, *Commit, error) {
 		return nil, nil, errors.New("repo: CAR has no roots")
 	}
 
-	store := mst.NewMemBlockStore()
 	commitCID := header.Roots[0]
 
 	// Read all blocks into the store.
 	for {
-		block, err := cr.Next()
+		block, err := next(cr)
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -84,8 +114,11 @@ func LoadFromCAR(r io.Reader) (*Repo, *Commit, error) {
 	// transient truncation it is (wrap io.ErrUnexpectedEOF) so download/retry
 	// logic re-fetches rather than permanently failing the repo.
 	commitData, err := store.GetBlock(commitCID)
-	if err != nil {
+	if errors.Is(err, mst.ErrBlockNotFound) {
 		return nil, nil, fmt.Errorf("repo: commit block not found: %w: %w", io.ErrUnexpectedEOF, err)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("repo: reading commit block: %w", err)
 	}
 	commit, err := decodeCommit(commitData)
 	if err != nil {

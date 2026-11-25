@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -873,6 +874,19 @@ type VerifierOptions struct {
 	// time (which is bounded by the apply phase alone).
 	ResyncTimeout gt.Option[time.Duration]
 
+	// ResyncDiskStore keeps resync CAR payloads in temporary files. When unset,
+	// resyncs use memory unless ResyncScratchBytes is positive.
+	ResyncDiskStore gt.Option[bool]
+
+	// ResyncScratchBytes caps shared temporary CAR payload bytes across this
+	// verifier's live synchronous and asynchronous resyncs. None or zero
+	// leaves disk storage unmetered when enabled. A positive quota implies
+	// disk storage and conflicts with explicitly disabling it. A resync that
+	// needs more space fails before chain state advances, with
+	// [repo.ErrCARSpillQuota] in the error chain. The temporary directory also
+	// needs room for filesystem metadata.
+	ResyncScratchBytes gt.Option[uint64]
+
 	// OnResync fires once per successful resync, after state has
 	// advanced and before ops return to the caller. oldRev is "" on
 	// the first resync ever performed for did. Invoked synchronously
@@ -1037,7 +1051,8 @@ type VerifierOptions struct {
 type Verifier struct {
 	_ noCopy
 
-	opts VerifierOptions
+	opts                VerifierOptions
+	resyncScratchBudget *repo.CARSpillBudget
 
 	// per-DID serialization. Two events for the same DID never run
 	// through verification concurrently. Bounded by MutexCapacity;
@@ -1105,8 +1120,8 @@ type Verifier struct {
 }
 
 // NewVerifier constructs a Verifier. Returns an error if required
-// options are missing: StateStore, Directory, and (under the default
-// PolicyResync) SyncClient.
+// options are invalid or missing: StateStore, Directory, and (under the
+// default PolicyResync) SyncClient are required.
 func NewVerifier(opts VerifierOptions) (*Verifier, error) {
 	if opts.StateStore == nil {
 		return nil, fmt.Errorf("sync: NewVerifier: StateStore is required")
@@ -1120,6 +1135,13 @@ func NewVerifier(opts VerifierOptions) (*Verifier, error) {
 			return nil, fmt.Errorf("sync: NewVerifier: SyncClient is required for PolicyResync")
 		}
 	}
+	scratchBytes := opts.ResyncScratchBytes.ValOr(0)
+	useDiskStore := opts.ResyncDiskStore.ValOr(scratchBytes > 0)
+	if scratchBytes > 0 && !useDiskStore {
+		return nil, fmt.Errorf("sync: NewVerifier: positive ResyncScratchBytes requires ResyncDiskStore")
+	}
+	opts.ResyncDiskStore = gt.Some(useDiskStore)
+
 	if !opts.ResyncLimit.HasVal() || opts.ResyncLimit.Val() == 0 {
 		opts.ResyncLimit = gt.Some(DefaultResyncLimit)
 	}
@@ -1160,17 +1182,18 @@ func NewVerifier(opts VerifierOptions) (*Verifier, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	v := &Verifier{
-		opts:         opts,
-		didMu:        lru.New[atmos.DID, *sync.Mutex](mutexCap, 0),
-		limiters:     lru.New[atmos.DID, *rate.Limiter](limiterCap, 0),
-		resyncStates: xsync.NewMap[atmos.DID, *didResyncState](),
-		resyncQueue:  make(chan resyncJob, 2*workers),
-		resyncDone:   make(chan ResyncEvent, resyncBuf),
-		asyncErrs:    make(chan error, errBuf),
-		pendingCap:   pendingCap,
-		workerCtx:    ctx,
-		workerCancel: cancel,
-		resyncOutbox: xsync.NewMap[atmos.DID, []ResyncEvent](),
+		opts:                opts,
+		resyncScratchBudget: repo.NewCARSpillBudget(scratchBytes),
+		didMu:               lru.New[atmos.DID, *sync.Mutex](mutexCap, 0),
+		limiters:            lru.New[atmos.DID, *rate.Limiter](limiterCap, 0),
+		resyncStates:        xsync.NewMap[atmos.DID, *didResyncState](),
+		resyncQueue:         make(chan resyncJob, 2*workers),
+		resyncDone:          make(chan ResyncEvent, resyncBuf),
+		asyncErrs:           make(chan error, errBuf),
+		pendingCap:          pendingCap,
+		workerCtx:           ctx,
+		workerCancel:        cancel,
+		resyncOutbox:        xsync.NewMap[atmos.DID, []ResyncEvent](),
 	}
 	v.startWorkers(workers)
 	return v, nil
@@ -1268,6 +1291,7 @@ func (v *Verifier) resyncTimeout() time.Duration {
 type fetchedRepo struct {
 	rp     *repo.Repo
 	commit *repo.Commit
+	blocks io.Closer
 }
 
 // resyncFetch is the network half of a resync: hosting gate, per-DID
@@ -1330,18 +1354,42 @@ func (v *Verifier) resyncFetch(ctx context.Context, did atmos.DID, reason Resync
 	str := newSlowTransferReaderFromBody(body)
 	defer str.Close()
 
-	rp, commit, err := repo.LoadFromCAR(bufio.NewReader(str))
+	reader := bufio.NewReader(str)
+	var (
+		rp     *repo.Repo
+		commit *repo.Commit
+		blocks io.Closer
+	)
+	if v.opts.ResyncDiskStore.Val() {
+		rp, commit, blocks, err = repo.LoadFromCAROnDisk(reader, v.resyncScratchBudget)
+	} else {
+		rp, commit, err = repo.LoadFromCAR(reader)
+	}
 	if err != nil {
 		return fail(err)
 	}
 
 	// Verify the fetched commit's signature. No chain check: the
 	// whole point of resync is that the chain is broken.
+	verified := false
+	if blocks != nil {
+		defer func() {
+			if !verified {
+				_ = blocks.Close()
+			}
+		}()
+	}
 	if err := v.verifyCommitSignature(fetchCtx, did, commit); err != nil {
+		if blocks != nil {
+			if closeErr := blocks.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}
 		return fail(err)
 	}
+	verified = true
 
-	return &fetchedRepo{rp: rp, commit: commit}, nil
+	return &fetchedRepo{rp: rp, commit: commit, blocks: blocks}, nil
 }
 
 // resyncApplyLocked is the state half of a resync: validates the
@@ -1358,14 +1406,30 @@ func (v *Verifier) resyncFetch(ctx context.Context, did atmos.DID, reason Resync
 // deactivated the account.
 //
 // Returns the ops, the pre-apply rev ("" on first sighting), or an
-// error.
+// error. The apply phase owns and closes any temporary block store.
 func (v *Verifier) resyncApplyLocked(ctx context.Context, did atmos.DID, reason ResyncReason, fr *fetchedRepo) ([]VerifierOp, string, error) {
+	blocks := fr.blocks
+	releaseBlocks := func(cause error) error {
+		if blocks != nil {
+			closeErr := blocks.Close()
+			blocks = nil
+			if cause == nil {
+				return closeErr
+			}
+			if closeErr != nil {
+				return errors.Join(cause, closeErr)
+			}
+		}
+		return cause
+	}
+	defer func() { _ = releaseBlocks(nil) }()
+
 	if aiErr, err := v.checkHostingGate(ctx, did); err != nil {
 		v.resyncFailures.Add(1)
-		return nil, "", &ResyncFailedError{DID: did, Reason: reason, Cause: err}
+		return nil, "", &ResyncFailedError{DID: did, Reason: reason, Cause: releaseBlocks(err)}
 	} else if aiErr != nil {
 		v.resyncFailures.Add(1)
-		return nil, "", &ResyncFailedError{DID: did, Reason: ReasonAccountInactive, Cause: aiErr}
+		return nil, "", &ResyncFailedError{DID: did, Reason: ReasonAccountInactive, Cause: releaseBlocks(aiErr)}
 	}
 
 	commit := fr.commit
@@ -1388,18 +1452,32 @@ func (v *Verifier) resyncApplyLocked(ctx context.Context, did atmos.DID, reason 
 	// advanced during the unlocked download.
 	if err := validateFetchedCommit(did, commit, old); err != nil {
 		v.resyncFailures.Add(1)
-		return nil, "", &ResyncFailedError{DID: did, Reason: reason, Cause: err}
+		return nil, "", &ResyncFailedError{DID: did, Reason: reason, Cause: releaseBlocks(err)}
 	}
 
 	// Walk MST, build ops. Keep the zero-record case as a non-nil
 	// empty slice so downstream streaming can emit an explicit empty
 	// resync Event instead of confusing it with a silent drop.
 	ops := make([]VerifierOp, 0)
+	var firstOpByCID map[cbor.CID]int
+	if blocks != nil {
+		// The memory store already returns the same backing bytes for aliases.
+		firstOpByCID = make(map[cbor.CID]int)
+	}
 	walkErr := fr.rp.Tree.Walk(func(key string, val cbor.CID) error {
 		col, rkey := repo.SplitMSTKey(key)
-		data, err := fr.rp.Store.GetBlock(val)
-		if err != nil {
-			return fmt.Errorf("walk %s: %w", key, err)
+		var data []byte
+		if first, ok := firstOpByCID[val]; ok {
+			data = ops[first].BlockData
+		} else {
+			block, err := fr.rp.Store.GetBlock(val)
+			if err != nil {
+				return fmt.Errorf("walk %s: %w", key, err)
+			}
+			data = block
+			if firstOpByCID != nil {
+				firstOpByCID[val] = len(ops)
+			}
 		}
 		ops = append(ops, VerifierOp{
 			Action:     atmos.ActionResync,
@@ -1412,9 +1490,9 @@ func (v *Verifier) resyncApplyLocked(ctx context.Context, did atmos.DID, reason 
 		})
 		return nil
 	})
-	if walkErr != nil {
+	if err := releaseBlocks(walkErr); err != nil {
 		v.resyncFailures.Add(1)
-		return nil, "", &ResyncFailedError{DID: did, Reason: reason, Cause: walkErr}
+		return nil, "", &ResyncFailedError{DID: did, Reason: reason, Cause: err}
 	}
 
 	if err := v.opts.StateStore.SaveChain(ctx, did, ChainState{Rev: commit.Rev, Data: commit.Data}); err != nil {

@@ -13,6 +13,7 @@ require (
 	github.com/rivo/uniseg v0.4.7
 	github.com/stretchr/testify v1.11.1
 	gitlab.com/yawning/secp256k1-voi v0.0.0-20230925100816-f2616030848b
+	golang.org/x/sys v0.47.0
 	golang.org/x/time v0.15.0
 )
 
@@ -23,7 +24,6 @@ require (
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
