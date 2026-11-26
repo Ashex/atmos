@@ -887,6 +887,10 @@ type VerifierOptions struct {
 	// needs room for filesystem metadata.
 	ResyncScratchBytes gt.Option[uint64]
 
+	// MaxConcurrentResyncs bounds simultaneous full repository fetches and applies
+	// across inline, manual, and background resyncs. Zero leaves concurrency unchanged.
+	MaxConcurrentResyncs uint
+
 	// OnResync fires once per successful resync, after state has
 	// advanced and before ops return to the caller. oldRev is "" on
 	// the first resync ever performed for did. Invoked synchronously
@@ -1053,6 +1057,7 @@ type Verifier struct {
 
 	opts                VerifierOptions
 	resyncScratchBudget *repo.CARSpillBudget
+	resyncSlots         chan struct{}
 
 	// per-DID serialization. Two events for the same DID never run
 	// through verification concurrently. Bounded by MutexCapacity;
@@ -1179,9 +1184,14 @@ func NewVerifier(opts VerifierOptions) (*Verifier, error) {
 		errBuf = DefaultAsyncErrorBuffer
 	}
 
+	var slots chan struct{}
+	if opts.MaxConcurrentResyncs > 0 {
+		slots = make(chan struct{}, opts.MaxConcurrentResyncs)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	v := &Verifier{
+		resyncSlots:         slots,
 		opts:                opts,
 		resyncScratchBudget: repo.NewCARSpillBudget(scratchBytes),
 		didMu:               lru.New[atmos.DID, *sync.Mutex](mutexCap, 0),
@@ -1311,6 +1321,24 @@ type fetchedRepo struct {
 // with ResyncFailedError{Reason: ReasonAccountInactive} — the PDS
 // would refuse the getRepo anyway and we save the round-trip.
 func (v *Verifier) resyncFetch(ctx context.Context, did atmos.DID, reason ResyncReason) (*fetchedRepo, error) {
+	if v.resyncSlots == nil {
+		return v.fetchRepo(ctx, did, reason)
+	}
+	// Wait outside the DID lock and before starting the download timeout.
+	select {
+	case v.resyncSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	fr, err := v.fetchRepo(ctx, did, reason)
+	if err != nil {
+		<-v.resyncSlots
+		return nil, err
+	}
+	return fr, nil // resyncApplyLocked releases the slot after the tree walk.
+}
+
+func (v *Verifier) fetchRepo(ctx context.Context, did atmos.DID, reason ResyncReason) (*fetchedRepo, error) {
 	if aiErr, err := v.checkHostingGate(ctx, did); err != nil {
 		v.resyncFailures.Add(1)
 		return nil, &ResyncFailedError{DID: did, Reason: reason, Cause: err}
@@ -1408,6 +1436,9 @@ func (v *Verifier) resyncFetch(ctx context.Context, did atmos.DID, reason Resync
 // Returns the ops, the pre-apply rev ("" on first sighting), or an
 // error. The apply phase owns and closes any temporary block store.
 func (v *Verifier) resyncApplyLocked(ctx context.Context, did atmos.DID, reason ResyncReason, fr *fetchedRepo) ([]VerifierOp, string, error) {
+	if v.resyncSlots != nil {
+		defer func() { <-v.resyncSlots }()
+	}
 	blocks := fr.blocks
 	releaseBlocks := func(cause error) error {
 		if blocks != nil {
